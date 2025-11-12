@@ -1,0 +1,137 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import statsmodels.api as sm
+import scipy
+import scipy.stats as stats
+from scipy.stats import chi2_contingency
+
+
+# import datasets
+df = pd.read_csv('/content/drive/My Drive/Dsx/dsxdataset5v2.csv')
+
+categories = ["mintmark", "composition"]
+values = ["faceval", "year", "rarem", "mintage x1000"]
+
+def correlation_ratio(categories, values):
+    categories = np.array(categories)
+    values = np.array(values)
+    mean_total = np.mean(values)
+    ss_between = 0
+    for cat in np.unique(categories):
+        values_cat = values[categories == cat]
+        mean_cat = np.mean(values_cat)
+        ss_between += len(values_cat) * (mean_cat - mean_total) ** 2
+    ss_total = np.sum((values - mean_total) ** 2)
+    return np.sqrt(ss_between / ss_total) if ss_total != 0 else 0
+
+eta = correlation_ratio(df["mintmark"], df["faceval"])
+print("η(mintamrk vs faceval) =", eta)
+
+def cramers_v(x, y):
+    confusion_matrix = pd.crosstab(x, y)
+    chi2 = chi2_contingency(confusion_matrix)[0]
+    n = confusion_matrix.sum().sum()
+    phi2 = chi2/n
+    r,k = confusion_matrix.shape
+    phi2corr = max(0, phi2 - ((k-1)*(r-1))/(n-1))
+    rcorr = r - ((r-1)**2)/(n-1)
+    kcorr = k - ((k-1)**2)/(n-1)
+    return np.sqrt(phi2corr / min((kcorr-1), (rcorr-1)))
+
+# --- Mixed correlation matrix ---
+def mixed_corr(df):
+    cols = df.columns
+    corr_matrix = pd.DataFrame(np.zeros((len(cols), len(cols))), columns=cols, index=cols)
+
+    for i in range(len(cols)):
+        for j in range(len(cols)):
+            if i == j:
+                corr_matrix.iloc[i,j] = 1.0
+            else:
+                col1, col2 = df[cols[i]], df[cols[j]]
+
+                if pd.api.types.is_numeric_dtype(col1) and pd.api.types.is_numeric_dtype(col2):
+                    corr_matrix.iloc[i,j] = col1.corr(col2)  # Pearson
+                elif pd.api.types.is_categorical_dtype(col1) or col1.dtype == object:
+                    if pd.api.types.is_categorical_dtype(col2) or col2.dtype == object:
+                        corr_matrix.iloc[i,j] = cramers_v(col1, col2)  # Cat–Cat
+                    else:
+                        corr_matrix.iloc[i,j] = correlation_ratio(col1, col2)  # Cat–Num
+                else:  # Num–Cat
+                    corr_matrix.iloc[i,j] = correlation_ratio(col2, col1)
+    return corr_matrix
+
+corr = mixed_corr(df[["faceval", "year", "mintmark", "rarem", "composition", "price", "mintage x1000"]])
+print(corr)
+
+sns.heatmap(corr, annot=True, cmap="Blues")
+plt.show()
+
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import cross_val_score
+from sklearn.ensemble import RandomForestRegressor
+
+df['is_rare'] = df['rarem'] == 1
+
+features = ['faceval', 'year', 'mintmark', 'mintage x1000', 'composition']
+target = 'price'
+categorical = ['mintmark', 'composition']
+numeric = ['faceval', 'year', 'mintage x1000']
+
+df_common = df[~df['is_rare']].copy()
+df_rare   = df[df['is_rare']].copy()
+X_common = df_common[features]
+y_common = df_common[target]
+
+preprocessor = ColumnTransformer([
+    ('cat', OneHotEncoder(handle_unknown='ignore'), categorical),
+    ('num', 'passthrough', numeric)
+])
+
+model = Pipeline([
+    ('preprocessor', preprocessor),
+    ('regressor', RandomForestRegressor(n_estimators=200)) #random_state=42))
+])
+
+X_train, X_test, y_train, y_test = train_test_split(X_common, y_common, test_size=0.3)# random_state=42)
+'''df['log_price'] = np.log1p(df['price'])  # log(1 + price)
+model.fit(X_train, np.log1p(y_train))
+
+df['pred_log'] = model.predict(X_test)
+df['pred_price'] = np.expm1(df['pred_log'])'''
+model.fit(X_train, y_train)
+
+def predict_expected(row):
+    X_row = pd.DataFrame([row[features]])
+    return model.predict(X_row)[0]
+
+df['pred_expected'] = df.apply(lambda row: predict_expected(row) if not row['is_rare'] else None, axis=1)
+
+df['residual'] = df['price'] - df['pred_expected']
+df['residual_pct'] = df['residual'] / df['price']
+
+df['is_unusual'] = df['residual_pct'].abs() > 0.5
+
+df['unusual_score'] = df['residual'].abs()
+df_unusual = df[df['is_unusual']].sort_values('unusual_score', ascending=False)
+
+print(df_unusual[['year','faceval','mintmark','composition','price','pred_expected','residual']].head(20))
+
+
+df['pred_price'] = df.apply(predict_expected, axis=1)
+rare_multiplier = 5.3
+df.loc[df['rarem'] == 1, 'pred_price'] *= rare_multiplier
+y_pred_common = model.predict(X_test)
+mse = mean_squared_error(y_test, y_pred_common)
+r2 = r2_score(y_test, y_pred_common)
+
+print(f"Common coins MSE: {mse:,.2f}")
+print(f"Common coins R²: {r2:.3f}")
+print(df[['year','mintmark','price','pred_price','is_rare']].head(20))
